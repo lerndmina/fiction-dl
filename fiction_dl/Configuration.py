@@ -82,3 +82,24 @@ TextSourceFileMagicText = "LOCAL TEXT STORY"
 
 # The text that's supposed to serve as a chapter break in a text source file.
 TextSourceFileChapterBreak = "CHAPTER BREAK LINE"
+
+# FlareSolverr configuration for bypassing Cloudflare protection on sites like FFN.
+# Set to None to disable, or specify the port number (default: 8191).
+#
+# FlareSolverr is required for Cloudflare-protected sites like fanfiction.net.
+# To set up FlareSolverr, run it via Docker:
+#
+#   docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+#
+# Or with Docker Compose, add to your docker-compose.yml:
+#
+#   flaresolverr:
+#     image: ghcr.io/flaresolverr/flaresolverr:latest
+#     container_name: flaresolverr
+#     ports:
+#       - "8191:8191"
+#     restart: unless-stopped
+#
+# For more info: https://github.com/FlareSolverr/FlareSolverr
+#
+FlareSolverrPort = None

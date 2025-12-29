@@ -31,6 +31,7 @@
 from fiction_dl.Concepts.Chapter import Chapter
 from fiction_dl.Concepts.Extractor import Extractor
 from fiction_dl.Utilities.HTML import StripHTML
+from fiction_dl.Utilities import FlareSolverr
 import fiction_dl.Configuration as Configuration
 
 # Standard packages.
@@ -70,6 +71,125 @@ class ExtractorFFNet(Extractor):
 
         self._webSession.EnableCloudscraper(True)
         self._chapterParserName = "html5lib"
+        self._useFlareSolverr = Configuration.FlareSolverrPort is not None
+        self._flareSolverrChecked = False
+        self._flareSolverrAvailable = False
+
+    def _CheckFlareSolverr(self) -> bool:
+
+        ##
+        #
+        # Checks if FlareSolverr is available and warns if not.
+        #
+        # @return True if FlareSolverr is available, False otherwise.
+        #
+        ##
+
+        if self._flareSolverrChecked:
+            return self._flareSolverrAvailable
+
+        self._flareSolverrChecked = True
+
+        if not self._useFlareSolverr:
+            print()
+            print("! WARNING: FlareSolverr is not configured.")
+            print("  FFN and FictionPress use Cloudflare protection and downloads will likely fail.")
+            print("  To fix this, run FlareSolverr via Docker:")
+            print("    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest")
+            print()
+            self._flareSolverrAvailable = False
+            return False
+
+        # Check if FlareSolverr is actually responding
+        self._flareSolverrAvailable = FlareSolverr.IsFlareSolverrRunning(Configuration.FlareSolverrPort)
+
+        if not self._flareSolverrAvailable:
+            print()
+            print(f"! WARNING: FlareSolverr is not responding on port {Configuration.FlareSolverrPort}.")
+            print("  FFN and FictionPress use Cloudflare protection and downloads will likely fail.")
+            print("  Make sure FlareSolverr is running:")
+            print("    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest")
+            print()
+
+        return self._flareSolverrAvailable
+
+    def _GetSoup(self, url: str, parserName: str = "html.parser") -> Optional[BeautifulSoup]:
+
+        ##
+        #
+        # Gets BeautifulSoup for a URL, using FlareSolverr if configured.
+        #
+        # @param url        The URL to fetch.
+        # @param parserName The parser to use for BeautifulSoup.
+        #
+        # @return BeautifulSoup object, or None on failure.
+        #
+        ##
+
+        if self._useFlareSolverr:
+            html = FlareSolverr.SolveChallenge(url, Configuration.FlareSolverrPort)
+            if html:
+                return BeautifulSoup(html, parserName)
+            else:
+                logging.warning(f"FlareSolverr failed for {url}, falling back to cloudscraper")
+        
+        return self._webSession.GetSoup(url, parserName)
+
+    def ScanStory(self) -> bool:
+
+        ##
+        #
+        # Scans the story: generates the list of chapter URLs and retrieves the
+        # metadata. Overridden to use FlareSolverr when configured.
+        #
+        # @return **False** when the scan fails, **True** when it doesn't fail.
+        #
+        ##
+
+        if self.Story is None:
+            logging.error("The extractor isn't initialized.")
+            return False
+
+        # Check FlareSolverr availability and warn if not running
+        self._CheckFlareSolverr()
+
+        normalizedURL = self._GetNormalizedStoryURL(self.Story.Metadata.URL)
+
+        soup = self._GetSoup(normalizedURL, self._chapterParserName)
+        if not soup:
+            logging.error(f'Failed to download tag soup: "{normalizedURL}".')
+            return False
+
+        return self._InternallyScanStory(normalizedURL, soup)
+
+    def ExtractChapter(self, index: int) -> Optional[Chapter]:
+
+        ##
+        #
+        # Extracts specific chapter. Overridden to use FlareSolverr when configured.
+        #
+        # @param index The index of the chapter to be extracted.
+        #
+        # @return **True** if the chapter is extracted correctly, **False** otherwise.
+        #
+        ##
+
+        if index > len(self._chapterURLs):
+            logging.error(
+                f"Trying to extract chapter {index}. "
+                f"Only {len(self._chapterURLs)} chapter(s) located. "
+                f"The story supposedly has {self.Story.Metadata.ChapterCount} chapter(s)."
+            )
+            return None
+
+        chapterURL = self._chapterURLs[index - 1]
+
+        soup = self._GetSoup(chapterURL, self._chapterParserName)
+        if not soup:
+            logging.error(f'Failed to download tag soup: "{chapterURL}".')
+            return None
+
+        return self._InternallyExtractChapter(chapterURL, soup)
 
     def GetSupportedHostnames(self) -> List[str]:
 
@@ -111,7 +231,7 @@ class ExtractorFFNet(Extractor):
         siteURL = GetSiteURL(URL)
         normalizedURL = f"{siteURL}/u/{userID}/"
 
-        pageSoup = self._webSession.GetSoup(normalizedURL)
+        pageSoup = self._GetSoup(normalizedURL)
         if not pageSoup:
             return None
 
@@ -165,7 +285,7 @@ class ExtractorFFNet(Extractor):
 
         # Download the first page.
 
-        soup = self._webSession.GetSoup(normalizedURL)
+        soup = self._GetSoup(normalizedURL)
         if not soup:
             logging.error(f"Failed to download page: \"{normalizedURL}\".")
             return None
@@ -197,7 +317,7 @@ class ExtractorFFNet(Extractor):
         for pageIndex in range(1, lastPageIndex + 1):
 
             pageURL = f"{collectionURL}/99/0/{pageIndex}/0/0/0/0/"
-            soup = self._webSession.GetSoup(pageURL)
+            soup = self._GetSoup(pageURL)
             if not soup:
                 logging.error(f"Failed to download page: \"{pageURL}\".")
                 return None
@@ -257,13 +377,39 @@ class ExtractorFFNet(Extractor):
             logging.error("Word count field not found in header.")
             return False
 
-        datePublished = re.search("Published: ([\d//]+)", headerLines[3])
+        # Extract dates from span elements with data-xutime (Unix timestamps)
+        # This is the most reliable method as it's locale-independent
+        dateSpans = headerElement.find_all('span', attrs={'data-xutime': True})
+        
+        datePublishedTimestamp = None
+        dateUpdatedTimestamp = None
+        
+        # FFN puts dates in spans with data-xutime attributes
+        # The order is typically: Updated (if exists), then Published
+        if len(dateSpans) >= 2:
+            # Story has been updated: first span is Updated, second is Published
+            dateUpdatedTimestamp = dateSpans[-2].get('data-xutime')
+            datePublishedTimestamp = dateSpans[-1].get('data-xutime')
+        elif len(dateSpans) == 1:
+            # Story never updated: only Published exists
+            datePublishedTimestamp = dateSpans[-1].get('data-xutime')
+        
+        # Convert timestamps to dates, or fall back to text parsing
+        if datePublishedTimestamp:
+            datePublished = self._TimestampToDate(datePublishedTimestamp)
+        else:
+            # Fallback: try to parse from text with multiple formats
+            datePublished = self._ExtractDateFromText(headerLines[3], "Published")
+        
         if not datePublished:
-            logging.error("Date published field not found in header.")
-            return False
-
-        dateUpdated = re.search("Updated: ([\d//]+)", headerLines[3])
-        # If the story has just one chapter, this field won't be present.
+            logging.warning("Date published not found, using current date.")
+            datePublished = GetCurrentDate()
+        
+        if dateUpdatedTimestamp:
+            dateUpdated = self._TimestampToDate(dateUpdatedTimestamp)
+        else:
+            # Fallback: try to parse from text
+            dateUpdated = self._ExtractDateFromText(headerLines[3], "Updated")
 
         # Set the metadata.
 
@@ -271,12 +417,8 @@ class ExtractorFFNet(Extractor):
         self.Story.Metadata.Author = headerLines[1][4:].strip() # Removes the "By: " part.
         self.Story.Metadata.Summary = StripHTML(headerLines[2]).strip()
 
-        self.Story.Metadata.DatePublished = self._ReformatDate(datePublished.group(1))
-        self.Story.Metadata.DateUpdated = (
-            self._ReformatDate(dateUpdated.group(1))
-            if dateUpdated else
-            self.Story.Metadata.DatePublished
-        )
+        self.Story.Metadata.DatePublished = datePublished
+        self.Story.Metadata.DateUpdated = dateUpdated if dateUpdated else datePublished
 
         self.Story.Metadata.ChapterCount = int(chapterCount.group(1)) if chapterCount else 1
         self.Story.Metadata.WordCount = int(words.group(1).replace(",", ""))
@@ -350,27 +492,124 @@ class ExtractorFFNet(Extractor):
         return storyIDMatch.group(1)
 
     @staticmethod
+    def _TimestampToDate(timestamp: str) -> Optional[str]:
+
+        ##
+        #
+        # Converts a Unix timestamp to a date string.
+        #
+        # @param timestamp The Unix timestamp as a string.
+        #
+        # @return Date in YYYY-MM-DD format, or None on failure.
+        #
+        ##
+
+        if not timestamp:
+            return None
+
+        try:
+            ts = int(timestamp)
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except (ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _ExtractDateFromText(text: str, dateType: str) -> Optional[str]:
+
+        ##
+        #
+        # Extracts and parses a date from text, supporting multiple formats.
+        #
+        # @param text     The text containing the date.
+        # @param dateType The type of date to look for ("Published" or "Updated").
+        #
+        # @return Date in YYYY-MM-DD format, or None on failure.
+        #
+        ##
+
+        if not text:
+            return None
+
+        # Try multiple regex patterns for different date formats
+        patterns = [
+            # Numeric formats: m/d/yyyy, m/d/yy, m/d
+            rf"{dateType}:\s*([\d]+/[\d]+(?:/[\d]+)?)",
+            # Text formats: Mon DD, YYYY or Mon DD YYYY
+            rf"{dateType}:\s*([A-Za-z]{{3}}\s+\d{{1,2}},?\s+\d{{4}})",
+            # ISO format: YYYY-MM-DD
+            rf"{dateType}:\s*(\d{{4}}-\d{{2}}-\d{{2}})",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                dateStr = match.group(1)
+                parsed = ExtractorFFNet._ParseDateString(dateStr)
+                if parsed:
+                    return parsed
+
+        return None
+
+    @staticmethod
+    def _ParseDateString(dateStr: str) -> Optional[str]:
+
+        ##
+        #
+        # Parses a date string in various formats to YYYY-MM-DD.
+        #
+        # @param dateStr The date string to parse.
+        #
+        # @return Date in YYYY-MM-DD format, or None on failure.
+        #
+        ##
+
+        if not dateStr:
+            return None
+
+        # List of formats to try
+        formats = [
+            "%m/%d/%Y",      # 3/31/2011
+            "%m/%d/%y",      # 3/31/11
+            "%m/%d",         # 3/31 (assume current year)
+            "%b %d, %Y",     # Mar 31, 2011
+            "%b %d %Y",      # Mar 31 2011
+            "%B %d, %Y",     # March 31, 2011
+            "%B %d %Y",      # March 31 2011
+            "%Y-%m-%d",      # 2011-03-31
+            "%d %b %Y",      # 31 Mar 2011
+            "%d %B %Y",      # 31 March 2011
+        ]
+
+        dateStr = dateStr.strip()
+
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(dateStr, fmt)
+                # Handle short format without year
+                if fmt == "%m/%d":
+                    parsed = parsed.replace(year=datetime.now().year)
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+        return None
+
+    @staticmethod
     def _ReformatDate(date: str) -> Optional[str]:
+
+        ##
+        #
+        # Legacy method for backward compatibility.
+        # Reformats a date string to YYYY-MM-DD format.
+        #
+        # @param date The date string to reformat.
+        #
+        # @return Date in YYYY-MM-DD format, or current date on failure.
+        #
+        ##
 
         if not date:
             return None
 
-        try:
-
-            # Dates on FF.net come in two formats: "m/d/yyyy" and "m/d".
-            # We want to convert the shorter format to the longer one.
-
-            longDatePattern = re.compile("^\d+/\d+/\d+$")
-
-            if not longDatePattern.match(date):
-                date += f"/{datetime.now().year}"
-
-            # And then the longer format to the standard format.
-
-            date = datetime.strptime(date, "%m/%d/%Y").strftime("%Y-%m-%d")
-
-            return date
-
-        except ValueError:
-
-            return GetCurrentDate()
+        result = ExtractorFFNet._ParseDateString(date)
+        return result if result else GetCurrentDate()
